@@ -125,15 +125,18 @@ cp .env.example .env
 Edit `.env` and fill in your values:
 
 ```env
+AWS_PROFILE=default
 AWS_REGION=us-east-1
-BEDROCK_AGENT_ID=<YOUR_AGENT_ID>
-BEDROCK_AGENT_ALIAS_ID=TSTALIASID
-
-# Optional — omit to use your AWS CLI profile / SSO / IAM role:
-# AWS_ACCESS_KEY_ID=<YOUR_ACCESS_KEY>
-# AWS_SECRET_ACCESS_KEY=<YOUR_SECRET_KEY>
-# AWS_SESSION_TOKEN=<YOUR_SESSION_TOKEN>
+AGENT_RUNTIME_ARN=<YOUR_AGENT_RUNTIME_ARN>
 ```
+
+`AGENT_RUNTIME_ARN` is printed at the end of `deploy.sh`. You can also look it up at any time:
+
+```bash
+cd kira && agentcore status --json    # the "runtime" entry's "arn"
+```
+
+The app signs requests with the named AWS profile (default: `default`), so no access keys go in `.env`.
 
 Install dependencies and start the UI:
 
@@ -189,11 +192,15 @@ The deploy script will fail at agent creation if model access hasn't been reques
 - Keep Lambda outside a VPC (default), or
 - Ensure the VPC has a route to the internet and the Prometheus ELB security group allows inbound on port 9090.
 
-### Agent stuck in PREPARING state
-After running `deploy.sh`, the agent status shows `PREPARING`. This is normal and takes 30–60 seconds. If it stays in this state, check the Bedrock console for validation errors — usually caused by a malformed OpenAPI schema or a Lambda ARN that doesn't exist.
+### Deployment status
+Check what `agentcore deploy` created, and whether each resource is `deployed`:
+
+```bash
+cd kira && agentcore status
+```
 
 ### Streamlit shows "NOT CONFIGURED"
-The app requires `BEDROCK_AGENT_ID` and `BEDROCK_AGENT_ALIAS_ID` to be set in `.env`. If you started Streamlit before populating `.env`, stop it and restart — `load_dotenv()` only reads the file at startup.
+The app requires `AGENT_RUNTIME_ARN` to be set in `.env` (copy `.env.example` to `.env` first). If you started Streamlit before populating `.env`, stop it and restart — `load_dotenv()` only reads the file at startup.
 
 ```bash
 # Stop and restart
@@ -223,4 +230,4 @@ aws iam get-role-policy \
 ```
 
 ### AWS credentials not resolving in Streamlit
-If `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are left blank in `.env`, boto3 falls back to the default credential chain (`~/.aws/credentials`, environment variables, IAM role). If none of those are configured, Bedrock calls will fail with an auth error. Either fill in the credentials in `.env` or ensure your terminal session has valid AWS credentials before starting Streamlit.
+The app uses the AWS profile named by `AWS_PROFILE` in `.env` (default: `default`). If the profile doesn't exist, the app fails at startup with `ProfileNotFound`; if it uses SSO, run `aws sso login` first. Check which account it resolves to with `aws sts get-caller-identity --profile default` — it must be the account that owns the runtime.
