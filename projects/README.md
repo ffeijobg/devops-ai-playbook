@@ -523,30 +523,79 @@ The dashboard has a **Service** dropdown variable at the top — use it to filte
 
 ### Log Forwarding to CloudWatch (Optional)
 
-Install Fluent Bit to forward pod logs to CloudWatch:
+Install Fluent Bit to forward pod logs to CloudWatch. The `fetch_logs` Lambda reads from the `/eks/boutique/pods` log group, which **Fluent Bit creates itself** the first time it ships logs. If the pod cannot authenticate to AWS, the group is never created and the Lambda returns `Log group '/eks/boutique/pods' does not exist`.
+
+#### 1. Create an IAM role for the Fluent Bit service account (IRSA)
+
+Fluent Bit pods cannot use the node role's credentials on this cluster (the node metadata service is not reachable from pods), so the service account needs its own role.
+
+| Requirement | Value |
+|---|---|
+| Role name | `FluentBitCloudWatchRole` |
+| Trust policy | Federated principal = the cluster's OIDC provider; condition `<oidc-issuer>:sub` = `system:serviceaccount:amazon-cloudwatch:aws-for-fluent-bit` |
+| Permissions | `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`, `logs:DescribeLogStreams` (the managed policy `CloudWatchAgentServerPolicy` also works) |
+
+Get the OIDC issuer with:
+```bash
+aws eks describe-cluster --name eks-cluster --region us-east-1 \
+  --query "cluster.identity.oidc.issuer" --output text
+```
+
+#### 2. Install Fluent Bit
+
+Run this in **bash** (Git Bash or WSL):
 
 ```bash
 helm repo add aws https://aws.github.io/eks-charts
 helm repo update
 
-helm upgrade --install aws-for-fluent-bit aws/aws-for-fluent-bit \
+MSYS_NO_PATHCONV=1 helm upgrade --install aws-for-fluent-bit aws/aws-for-fluent-bit \
   --namespace amazon-cloudwatch \
   --create-namespace \
-  --set cloudWatch.enabled=true \
-  --set cloudWatch.region=us-east-1 \
-  --set cloudWatch.logGroupName=/eks/boutique/pods \
-  --set cloudWatch.logStreamPrefix=from-fluent-bit- \
+  --set cloudWatchLogs.enabled=true \
+  --set cloudWatchLogs.region=us-east-1 \
+  --set cloudWatchLogs.logGroupName=/eks/boutique/pods \
+  --set cloudWatchLogs.logStreamPrefix=from-fluent-bit- \
   --set firehose.enabled=false \
   --set kinesis.enabled=false \
-  --set elasticsearch.enabled=false
+  --set elasticsearch.enabled=false \
+  --set 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::970572474690:role/FluentBitCloudWatchRole'
 ```
 
-Verify:
+Notes:
+- Use the `cloudWatchLogs.*` keys. The older `cloudWatch.*` keys are deprecated.
+- `MSYS_NO_PATHCONV=1` is required on **Git Bash for Windows**. Without it, Git Bash rewrites `/eks/boutique/pods` into `C:/Program Files/Git/eks/boutique/pods`, and CloudWatch rejects the name with `InvalidParameterException`. (A double leading slash, `//eks/boutique/pods`, also works. PowerShell is not affected, but use backticks instead of `\` for line continuation there.)
+- If the service account was changed after the pods started, restart them so the new credentials are injected:
+  ```bash
+  kubectl rollout restart ds/aws-for-fluent-bit -n amazon-cloudwatch
+  ```
+
+#### 3. Verify
+
 ```bash
-kubectl get pods -n amazon-cloudwatch
+# Role is attached to the service account
+kubectl get sa aws-for-fluent-bit -n amazon-cloudwatch -o yaml | grep role-arn
+
+# Pod has the IRSA credentials (expect AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE)
+kubectl get pod -n amazon-cloudwatch -l app.kubernetes.io/name=aws-for-fluent-bit \
+  -o jsonpath='{.items[0].spec.containers[0].env[*].name}'
+
+# Log group name is correct, and there are no errors
+kubectl get cm aws-for-fluent-bit -n amazon-cloudwatch -o yaml | grep log_group_name
+kubectl logs -n amazon-cloudwatch -l app.kubernetes.io/name=aws-for-fluent-bit --tail=20
 ```
 
 Logs appear in **CloudWatch → Log groups → /eks/boutique/pods**.
+
+#### Troubleshooting
+
+| Symptom in Fluent Bit logs | Cause | Fix |
+|---|---|---|
+| `could not sign request` / `Provider returned no credentials` | Service account has no IAM role | Add the `role-arn` annotation (step 2) and restart the pods |
+| `broken connection to 169.254.169.254` | Pod cannot reach the node metadata service | Use IRSA instead of the node role |
+| `InvalidParameterException ... logGroupName ... pattern` | Git Bash rewrote the path | Re-run with `MSYS_NO_PATHCONV=1` |
+| `AccessDeniedException` | Role is missing a CloudWatch Logs permission, or the trust policy does not name `system:serviceaccount:amazon-cloudwatch:aws-for-fluent-bit` | Fix the role policy or trust policy |
+| Pod keeps restarting (liveness probe `500`) | Fluent Bit's health check fails while its output errors | Fix the underlying error above and the restarts stop |
 
 ---
 
